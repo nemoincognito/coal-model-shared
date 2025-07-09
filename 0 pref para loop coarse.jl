@@ -130,6 +130,35 @@ if selected_coaltype == "coking"
 end
 =#
 
+#=
+
+################# MODEL INS OUTS AND CHANGES ############################
+#=
+Why am I doing this? So I can keep track of all the ins and outs and have a well configured function.
+
+Ins: 
+flowslist, df_pref_para_links, 
+df_pref_para_thermal, 
+df_pref_para_coking, 
+df_node_data, 
+df_coal_types, 
+df_demand, 
+edge_data, 
+df_cv_blend_range, 
+df_mms, 
+df_mass_inflows_by_node_and_prod_type,
+df_mng_chn_imp_cap
+
+changes:
+flowslist.mf #mass flow along each edge
+df_node_data.supply_item_mass_by_node #how much to supply from where
+
+Outs:
+flowslist_select
+
+
+=#
+
 ################################   START MODEL FORMULATION #############################################
 # time stamp: start build    
 start_build_time = now()
@@ -502,6 +531,8 @@ end_solve_time = now()
 #solve_time = end_solve_time - end_build_time
 total_time = end_solve_time - start_build_time
 print(total_time)
+
+############################## END MODEL BUILD #####################################
 
 # put it in one df. Could have been done earlier probably. Dont care
 # hook up supply to flows sheet
