@@ -519,6 +519,11 @@ flowslist.mf = value.(flowslist.mf)
 flowslist_select = select(filter(row -> row.mf !=0, flowslist), :orig_node_id, :dest_node_id, :region, :coal_group, :product_type, :mf, :total_gate_cost_usd_pt, :transp_cost_tot_usd, :CV_PJ_p_Mt_therm, :transm_cost_usd_GJ)
 XLSX.writetable(solutionxlsxfile, collect(eachcol(flowslist_select)), names(flowslist_select), overwrite=true)
 
+#=
+######### MODEL CALIBRATION FUNCTION ################
+function calibrate_model(flowslist_select, df_pref_para_links,df_pref_flow_coking,df_pref_flow_thermal)
+
+=#
 ### adjust coking coal pref para
 # find largest deviation for coking coal
 df_coking_calib = leftjoin(flowslist_select, df_pref_para_links, on = [:orig_node_id, :dest_node_id, :product_type])
