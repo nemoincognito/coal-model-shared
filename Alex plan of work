@@ -1,0 +1,37 @@
+## Diagnosis After Some Background Calls and Reading ##
+
+It seems that by focussing on just the largest deviation in the outcomes we are probably getting off track and doing an inefficient convergence. 
+
+So what I plan to do over the next few days while kids are at camp and tariff market insanity has been punted (for now):
+
+1. Wrap the optimization in a function that takes those global scope tables from the XLSX load and pushes outputs like the flows back to global scope. Why? 
+  a) Will make convergence faster using an existing solution (I am told this but we will find out)
+  b) Allows us to then run the convergence / gradient descent as a separate function so we can separate the parameter estimate process in a function. 
+  c) Avoids a lot of XLSX read / write during the process saving some time and memory.
+
+2. For the gradient descent / estimation process I am going to do the following:
+  a) Move the "performance metric" to absolute sum of deviations from target values. 
+  b) Select a $ per tonne amount as before (call it eta) but make it larger (say, $10) and then update the implied premium by (deviation_by_row / sum_abs_deviations) which is -1<0<1. That is the beta update paramater. 
+  c) Then rerun. If sum abs deviations shrinks take the $ per tonne base parameter in b (the $10 value) and then multiply it by abs_dev_new / abs_dev_old. So for each step:
+    eta_new = eta_old * sum_abs_devs_new / sum_abs_devs_old
+    beta_new_i = deviation_by_row_i / sum_abs_devs * eta_new 
+
+  This is pretty standard gradient descent algo stuff - the closer we get, the smaller the steps we take. The risk here is undershooting but we will know if we are on the right track. Then we can use the
+  table in d) to try some RMSProp or Adam type approach. 
+
+  d) For each run we print the premia to a table with the sum_abs_devs for that run. Then we can backtrack and see what is causing the flips and deviations. 
+
+
+Then with these two functions we just run:
+while counter<50:
+  do_optimization
+  do_parameter_update
+  do_table_write
+
+Then print the final run model and tables. 
+
+I won't implement an automatic stopping rule here - I think we just see how this goes for say 40 or 50 epochs / cycles and what it does. We can then do a deeper inspection using the pref_para_links
+for particular runs with big flips to see what mines are causing the big changes. I assume its almost certainly going to be the big provincial sources in the Woodmac data. 
+
+Alright, time to write this. 
+
