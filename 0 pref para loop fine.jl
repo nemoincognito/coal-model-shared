@@ -493,121 +493,341 @@ df_mng_chn_imp_cap = DataFrames.crossjoin(df_mng_chn_imp_cap, df_chn_mng_imports
     sum(r.pref_para * r.mf  * 1e6 for r in eachrow(flowslist)) + 
     sum(r.transm_cost_usd_GJ * 1e6 * r.mf  * 1e6 * r.CV_PJ_p_Mt_therm for r in eachrow(flowslist))
 );
-# time stamp: finish build    
 end_build_time = now()
-# And optimize the model:
+
+################################   CALIBRATION VIA GRAY WOLF OPTIMIZATION   ############################
+
+# ---- GWO Configuration ----
+const GWO_N_WOLVES     = 20     # population size
+const GWO_MAX_ITER     = 100    # maximum iterations
+const GWO_SEARCH_RANGE = 5.0    # search bounds around initial values (USD/t)
+const GWO_TOL          = 0.01   # convergence tolerance (sum of squared flow deviations, Mt^2)
+
+# ---- Precompute base objective coefficients for each flow variable (excluding pref_para) ----
+n_flows = nrow(flowslist)
+base_obj_coeff = Vector{Float64}(undef, n_flows)
+for i in 1:n_flows
+    base_obj_coeff[i] = coalesce(flowslist.transp_cost_tot_usd[i], 0.0) * 1e6 +
+                         coalesce(flowslist.transm_cost_usd_GJ[i], 0.0) * 1e12 *
+                         coalesce(flowslist.CV_PJ_p_Mt_therm[i], 0.0)
+end
+
+# ---- Build parameter vector and index mappings ----
+n_th = nrow(df_pref_para_thermal)
+n_ck = nrow(df_pref_para_coking)
+n_params = n_th + n_ck
+
+initial_params = vcat(
+    Vector{Float64}(df_pref_para_thermal.pref_para_thermal),
+    Vector{Float64}(df_pref_para_coking.pref_para_coking)
+)
+
+# (orig_grp, dest_grp, product_type) -> index in the flat parameter vector
+# Thermal parameters occupy 1:n_th, coking parameters (n_th+1):(n_th+n_ck)
+param_key_to_idx = Dict{Tuple{Any,Any,Any}, Int}()
+for i in 1:n_th
+    param_key_to_idx[(df_pref_para_thermal.orig_grp[i],
+                      df_pref_para_thermal.dest_grp[i],
+                      df_pref_para_thermal.product_type[i])] = i
+end
+for i in 1:n_ck
+    param_key_to_idx[(df_pref_para_coking.orig_grp[i],
+                      df_pref_para_coking.dest_grp[i],
+                      df_pref_para_coking.product_type[i])] = n_th + i
+end
+
+# Map each network edge to its parameter index via the links table
+edge_to_param = Dict{Tuple{Any,Any,Any}, Int}()
+for r in eachrow(df_pref_para_links)
+    pidx = get(param_key_to_idx, (r.orig_grp, r.dest_grp, r.product_type), 0)
+    if pidx > 0
+        edge_to_param[(r.orig_node_id, r.dest_node_id, r.product_type)] = pidx
+    end
+end
+
+# Map each flowslist row to its parameter index (0 = no preference parameter)
+flow_to_param = zeros(Int, n_flows)
+for i in 1:n_flows
+    flow_to_param[i] = get(edge_to_param,
+        (flowslist.orig_node_id[i], flowslist.dest_node_id[i], flowslist.product_type[i]), 0)
+end
+
+flow_vars = flowslist.mf
+df_links_for_join = select(df_pref_para_links,
+    :orig_node_id, :dest_node_id, :product_type, :orig_grp, :dest_grp)
+
+# Snapshot column data for use inside the fitness function (avoids aliasing issues)
+fl_orig  = copy(flowslist.orig_node_id)
+fl_dest  = copy(flowslist.dest_node_id)
+fl_ptype = copy(flowslist.product_type)
+
+# ---- Helper: update objective coefficients for a candidate parameter vector ----
+function update_objective!(model, flow_vars, param_vec, flow_to_param, base_obj_coeff)
+    for i in eachindex(flow_vars)
+        pidx = flow_to_param[i]
+        pp = pidx > 0 ? param_vec[pidx] : 0.0
+        set_objective_coefficient(model, flow_vars[i], base_obj_coeff[i] + pp * 1e6)
+    end
+end
+
+# ---- Helper: solve model and return sum-of-squared-deviation fitness ----
+function compute_fitness(model, flow_vars, fl_orig, fl_dest, fl_ptype,
+                         df_links_for_join, df_pref_flow_thermal, df_pref_flow_coking)
+    optimize!(model)
+
+    local flow_vals
+    try
+        flow_vals = value.(flow_vars)
+    catch
+        return Inf
+    end
+
+    df_sol = DataFrame(orig_node_id = fl_orig, dest_node_id = fl_dest,
+                       product_type = fl_ptype, mf = flow_vals)
+    df_sol = filter(row -> row.mf > 1e-8, df_sol)
+    df_sol = leftjoin(df_sol, df_links_for_join,
+                      on = [:orig_node_id, :dest_node_id, :product_type])
+    df_sol = dropmissing(df_sol, :orig_grp)
+
+    total_dev = 0.0
+
+    # ---- Coking coal deviation ----
+    df_ck = filter(row -> row.product_type == "Metallurgical", df_sol)
+    if nrow(df_ck) > 0
+        df_ck_agg = DataFrames.DataFrame(
+            (orig_grp = k.orig_grp, dest_grp = k.dest_grp, mf = sum(g.mf)) for
+            (k, g) in pairs(DataFrames.groupby(df_ck, [:orig_grp, :dest_grp])))
+        df_ck_cmp = leftjoin(
+            select(df_pref_flow_coking, :orig_grp, :dest_grp, :pref_flow_Mt),
+            df_ck_agg, on = [:orig_grp, :dest_grp])
+        replace!(df_ck_cmp.mf, missing => 0.0)
+        total_dev += sum((df_ck_cmp.mf .- df_ck_cmp.pref_flow_Mt) .^ 2)
+    else
+        total_dev += sum(df_pref_flow_coking.pref_flow_Mt .^ 2)
+    end
+
+    # ---- Thermal coal deviation (with CV correction) ----
+    df_th = filter(row -> row.product_type == "Thermal", df_sol)
+    if nrow(df_th) > 0
+        df_th_agg = DataFrames.DataFrame(
+            (orig_grp = k.orig_grp, dest_grp = k.dest_grp, mf = sum(g.mf)) for
+            (k, g) in pairs(DataFrames.groupby(df_th, [:orig_grp, :dest_grp])))
+        df_th_cmp = leftjoin(
+            select(df_pref_flow_thermal, :orig_grp, :dest_grp, :pref_flow_Mt),
+            df_th_agg, on = [:orig_grp, :dest_grp])
+        replace!(df_th_cmp.mf, missing => 0.0)
+        # CV correction: scale modelled mass flows per destination
+        df_th_totals = DataFrames.DataFrame(
+            (dest_grp = k.dest_grp, mf_sum = sum(g.mf), pref_sum = sum(g.pref_flow_Mt)) for
+            (k, g) in pairs(DataFrames.groupby(df_th_cmp, [:dest_grp])))
+        df_th_totals.th_factor = ifelse.(df_th_totals.mf_sum .> 1e-8,
+            df_th_totals.pref_sum ./ df_th_totals.mf_sum, 1.0)
+        df_th_totals[df_th_totals.dest_grp .== "China", :th_factor] .= 1.0
+        df_th_cmp = leftjoin(df_th_cmp,
+            select(df_th_totals, :dest_grp, :th_factor), on = :dest_grp)
+        df_th_cmp.mf_adj = df_th_cmp.mf .* df_th_cmp.th_factor
+        total_dev += sum((df_th_cmp.mf_adj .- df_th_cmp.pref_flow_Mt) .^ 2)
+    else
+        total_dev += sum(df_pref_flow_thermal.pref_flow_Mt .^ 2)
+    end
+
+    return total_dev
+end
+
+# ---- Gray Wolf Optimization ----
+function gray_wolf_optimize(fitness_fn, n_dim, x0;
+                            n_wolves     = GWO_N_WOLVES,
+                            max_iter     = GWO_MAX_ITER,
+                            search_range = GWO_SEARCH_RANGE,
+                            tol          = GWO_TOL)
+    lb = x0 .- search_range
+    ub = x0 .+ search_range
+
+    # First wolf starts at initial (current best-guess) parameters; rest are random
+    wolves = Vector{Vector{Float64}}(undef, n_wolves)
+    wolves[1] = copy(x0)
+    for w in 2:n_wolves
+        wolves[w] = lb .+ rand(n_dim) .* (ub .- lb)
+    end
+
+    fit = [fitness_fn(wolves[w]) for w in 1:n_wolves]
+
+    order = sortperm(fit)
+    alpha, alpha_fit = copy(wolves[order[1]]), fit[order[1]]
+    beta  = copy(wolves[order[min(2, n_wolves)]])
+    delta = copy(wolves[order[min(3, n_wolves)]])
+
+    println("GWO init      | SSE = $(round(alpha_fit, digits=6)) | " *
+            "RMSE = $(round(sqrt(alpha_fit), digits=4)) Mt")
+
+    for iter in 1:max_iter
+        a = 2.0 * (1.0 - iter / max_iter)
+
+        for i in 1:n_wolves
+            for j in 1:n_dim
+                r1, r2 = rand(), rand()
+                A1, C1 = 2a * r1 - a, 2r2
+                X1 = alpha[j] - A1 * abs(C1 * alpha[j] - wolves[i][j])
+
+                r1, r2 = rand(), rand()
+                A2, C2 = 2a * r1 - a, 2r2
+                X2 = beta[j]  - A2 * abs(C2 * beta[j]  - wolves[i][j])
+
+                r1, r2 = rand(), rand()
+                A3, C3 = 2a * r1 - a, 2r2
+                X3 = delta[j] - A3 * abs(C3 * delta[j] - wolves[i][j])
+
+                wolves[i][j] = clamp((X1 + X2 + X3) / 3.0, lb[j], ub[j])
+            end
+            fit[i] = fitness_fn(wolves[i])
+        end
+
+        order = sortperm(fit)
+        if fit[order[1]] < alpha_fit
+            alpha     = copy(wolves[order[1]])
+            alpha_fit = fit[order[1]]
+        end
+        beta  = copy(wolves[order[min(2, n_wolves)]])
+        delta = copy(wolves[order[min(3, n_wolves)]])
+
+        println("GWO $(lpad(iter, 4))/$max_iter | SSE = $(round(alpha_fit, digits=6)) | " *
+                "RMSE = $(round(sqrt(alpha_fit), digits=4)) Mt | a = $(round(a, digits=3))")
+
+        if alpha_fit < tol
+            println("Converged at iteration $iter (SSE < $tol)")
+            break
+        end
+    end
+
+    return alpha, alpha_fit
+end
+
+# ---- Run GWO calibration ----
+println("\n" * "="^60)
+println("GWO calibration: $n_params parameters ($n_th thermal, $n_ck coking)")
+println("Wolves: $GWO_N_WOLVES | Max iter: $GWO_MAX_ITER | " *
+        "Range: +/-$GWO_SEARCH_RANGE | Tol: $GWO_TOL")
+println("="^60 * "\n")
+
+start_gwo_time = now()
+
+gwo_fitness = function(param_vec)
+    update_objective!(cn_coal_model, flow_vars, param_vec, flow_to_param, base_obj_coeff)
+    return compute_fitness(cn_coal_model, flow_vars, fl_orig, fl_dest, fl_ptype,
+                           df_links_for_join, df_pref_flow_thermal, df_pref_flow_coking)
+end
+
+best_params, best_fitness = gray_wolf_optimize(gwo_fitness, n_params, initial_params)
+
+# ---- Final solve with best parameters ----
+update_objective!(cn_coal_model, flow_vars, best_params, flow_to_param, base_obj_coeff)
 optimize!(cn_coal_model)
-end_solve_time = now()
-#build_time = end_build_time - start_build_time
-#solve_time = end_solve_time - end_build_time
-total_time = end_solve_time - start_build_time
-print(total_time)
 
-# put it in one df. Could have been done earlier probably. Dont care
-# hook up supply to flows sheet
+end_time = now()
+println("\n" * "="^60)
+println("GWO calibration complete")
+println("Build time : $(end_build_time - start_build_time)")
+println("GWO time   : $(end_time - start_gwo_time)")
+println("Total time : $(end_time - start_build_time)")
+println("Best SSE   : $(round(best_fitness, digits=6))")
+println("Best RMSE  : $(round(sqrt(best_fitness), digits=4)) Mt")
+println("="^60 * "\n")
+
+################################   WRITE RESULTS   ####################################################
+
+# ---- Write best preference parameters back to dataframes ----
+df_pref_para_thermal.pref_para_thermal = best_params[1:n_th]
+df_pref_para_coking.pref_para_coking   = best_params[n_th+1:end]
+
+# ---- Extract final solution ----
 df_node_data.supply_item_mass_by_node = value.(df_node_data.supply_item_mass_by_node)
-df_node_data_select = select(filter(row -> row.supply_item_mass_by_node >0, df_node_data), :node_id, :coal_group, :total_gate_cost_usd_pt)
-flowslist = DataFrames.leftjoin(flowslist, df_node_data_select, on = [:orig_node_id => :node_id, :coal_group],)
-# hook up regions
+df_node_data_select = select(
+    filter(row -> row.supply_item_mass_by_node > 0, df_node_data),
+    :node_id, :coal_group, :total_gate_cost_usd_pt)
+flowslist = DataFrames.leftjoin(flowslist, df_node_data_select,
+    on = [:orig_node_id => :node_id, :coal_group])
 df_node_regions = unique(select(df_node_data, :node_id, :region))
-flowslist = DataFrames.leftjoin(flowslist, df_node_regions, on = [:dest_node_id => :node_id],)
-# print solution to file
-# Write solution to
-solutionxlsxfilename = string("solution latest.xlsx")
-solutionxlsxfile = joinpath(outputpath, solutionxlsxfilename)
+flowslist = DataFrames.leftjoin(flowslist, df_node_regions,
+    on = [:dest_node_id => :node_id])
+
 flowslist.mf = value.(flowslist.mf)
-flowslist_select = select(filter(row -> row.mf !=0, flowslist), :orig_node_id, :dest_node_id, :region, :coal_group, :product_type, :mf, :total_gate_cost_usd_pt, :transp_cost_tot_usd, :CV_PJ_p_Mt_therm, :transm_cost_usd_GJ)
-XLSX.writetable(solutionxlsxfile, collect(eachcol(flowslist_select)), names(flowslist_select), overwrite=true)
+flowslist_select = select(
+    filter(row -> row.mf != 0, flowslist),
+    :orig_node_id, :dest_node_id, :region, :coal_group, :product_type,
+    :mf, :total_gate_cost_usd_pt, :transp_cost_tot_usd, :CV_PJ_p_Mt_therm, :transm_cost_usd_GJ)
 
-### adjust coking coal pref para
-# find largest deviation for coking coal
-df_coking_calib = leftjoin(flowslist_select, df_pref_para_links, on = [:orig_node_id, :dest_node_id, :product_type])
-df_coking_calib = select(filter(row -> row.product_type =="Metallurgical", df_coking_calib), [:orig_node_id, :dest_node_id, :orig_grp, :dest_grp, :product_type, :mf])
-df_coking_calib = dropmissing(df_coking_calib, :orig_grp)
-# sum all flows per link
-df_coking_calib = DataFrames.DataFrame(
-    (orig_grp = i.orig_grp, dest_grp = i.dest_grp, mf = sum(df.mf)) for
-    (i, df) in pairs(DataFrames.groupby(df_coking_calib, [:orig_grp, :dest_grp]))
-)
-# add observed values
-df_coking_calib = leftjoin(df_pref_flow_coking, df_coking_calib, on = [:orig_grp, :dest_grp])
-replace!(df_coking_calib.mf, missing => 0)
-df_coking_calib.mf = round.(df_coking_calib.mf; digits = 3)
-df_coking_calib.flow_diff = df_coking_calib.mf .- df_coking_calib.pref_flow_Mt
-df_coking_calib.flow_diff_abs = abs.(df_coking_calib.flow_diff)
-df_coking_calib.max .= maximum(df_coking_calib.flow_diff_abs)
-coking_max_dev = maximum(df_coking_calib.flow_diff_abs)
-# dumb mess because ifelse statement are completely impossible
-df_coking_calib[!,:pref_para_adj] .= 0.01
-df_coking_calib[!,:pref_para_multiplier] .= 1
-df_coking_calib[!,:pref_para_converged] .= 1
-df_coking_calib[df_coking_calib.flow_diff_abs .!= df_coking_calib.max, :pref_para_adj] .= 0
-df_coking_calib[df_coking_calib.flow_diff .<= 0, :pref_para_multiplier] .= -1
-df_coking_calib[df_coking_calib.max .<= 0.1, :pref_para_converged] .= 0 # once differenes are below 2 Mt, stop adjusting pref para
-df_coking_calib.pref_para_adj = df_coking_calib.pref_para_adj .* df_coking_calib.pref_para_multiplier .* df_coking_calib.pref_para_converged
-df_coking_calib = select(df_coking_calib, [:orig_grp, :dest_grp, :product_type, :pref_para_adj])
-# and now hook up with pref para df to create new dataframe
-df_pref_para_coking  = leftjoin(df_pref_para_coking, df_coking_calib, on = [:orig_grp, :dest_grp, :product_type])
-df_pref_para_coking.pref_para_coking = df_pref_para_coking.pref_para_coking .+ df_pref_para_coking.pref_para_adj
-df_pref_para_coking = select(df_pref_para_coking, [:orig_grp, :dest_grp, :product_type, :pref_para_coking])
-# and save to file
-prefparaxlsxfilename = string("pref para coking.xlsx")
-prefparaxlsxfile = joinpath(outputpath, prefparaxlsxfilename)
-XLSX.writetable(prefparaxlsxfile, collect(eachcol(df_pref_para_coking)), names(df_pref_para_coking), overwrite=true)
-# copy of solution file with a datestamp
-prefparaxlsxfilename = string("pref para coking ", round(coking_max_dev, digits=2), " Mt ", Dates.format(now(), "yyyy-mm-dd HH-MM-SS"), ".xlsx")
-prefparaxlsxfile = joinpath(ckprefparaoutputpath, prefparaxlsxfilename)
-XLSX.writetable(prefparaxlsxfile, collect(eachcol(df_pref_para_coking)), names(df_pref_para_coking), overwrite=true)
+# ---- Compute per-product max deviations for file naming ----
+function max_abs_deviation(flowslist_select, df_pref_para_links, df_pref_flow, product_filter;
+                           cv_correct = false)
+    df_cal = leftjoin(flowslist_select, df_pref_para_links,
+        on = [:orig_node_id, :dest_node_id, :product_type])
+    df_cal = select(filter(row -> row.product_type == product_filter, df_cal),
+        [:orig_node_id, :dest_node_id, :orig_grp, :dest_grp, :product_type, :mf])
+    df_cal = dropmissing(df_cal, :orig_grp)
+    df_cal = DataFrames.DataFrame(
+        (orig_grp = k.orig_grp, dest_grp = k.dest_grp, mf = sum(g.mf)) for
+        (k, g) in pairs(DataFrames.groupby(df_cal, [:orig_grp, :dest_grp])))
+    df_cal = leftjoin(df_pref_flow, df_cal, on = [:orig_grp, :dest_grp])
+    replace!(df_cal.mf, missing => 0.0)
+    df_cal.mf = round.(df_cal.mf; digits = 3)
 
-### adjust thermal coal pref para
-# find largest deviation for thermal coal
-df_thermal_calib = leftjoin(flowslist_select, df_pref_para_links, on = [:orig_node_id, :dest_node_id, :product_type])
-df_thermal_calib = select(filter(row -> row.product_type =="Thermal", df_thermal_calib), [:orig_node_id, :dest_node_id, :orig_grp, :dest_grp, :product_type, :mf])
-df_thermal_calib = dropmissing(df_thermal_calib, :orig_grp)
-# sum all flows per link
-df_thermal_calib = DataFrames.DataFrame(
-    (orig_grp = i.orig_grp, dest_grp = i.dest_grp, mf = sum(df.mf)) for
-    (i, df) in pairs(DataFrames.groupby(df_thermal_calib, [:orig_grp, :dest_grp]))
-)
-# add observed values
-df_thermal_calib = leftjoin(df_pref_flow_thermal, df_thermal_calib, on = [:orig_grp, :dest_grp])
-replace!(df_thermal_calib.mf, missing => 0)
-df_thermal_calib.mf = round.(df_thermal_calib.mf; digits = 3)
-# recalibrate for thermal coal CV differences
-df_thermal_factor=groupby(df_thermal_calib, :dest_grp)
-df_thermal_factor=combine(df_thermal_factor, :mf => sum, :pref_flow_Mt => sum)
-df_thermal_factor.th_factor = df_thermal_factor.pref_flow_Mt_sum ./ df_thermal_factor.mf_sum
-df_thermal_factor[df_thermal_factor.dest_grp .== "China", :th_factor] .= 1
-df_thermal_factor = select(df_thermal_factor, [:dest_grp, :th_factor])
-# rejoin with calib df
-df_thermal_calib = leftjoin(df_thermal_calib, df_thermal_factor, on = [:dest_grp])
-df_thermal_calib.mf = df_thermal_calib.mf .* df_thermal_calib.th_factor
-df_thermal_calib.flow_diff = df_thermal_calib.mf .- df_thermal_calib.pref_flow_Mt
-df_thermal_calib.flow_diff_abs = abs.(df_thermal_calib.flow_diff)
-df_thermal_calib.max .= maximum(df_thermal_calib.flow_diff_abs)
-thermal_max_dev = maximum(df_thermal_calib.flow_diff_abs)
-# dumb mess because ifelse statement are completely impossible
-df_thermal_calib[!,:pref_para_adj] .= 0.01
-df_thermal_calib[!,:pref_para_multiplier] .= 1
-df_thermal_calib[!,:pref_para_converged] .= 1
-df_thermal_calib[df_thermal_calib.flow_diff_abs .!= df_thermal_calib.max, :pref_para_adj] .= 0
-df_thermal_calib[df_thermal_calib.flow_diff .<= 0, :pref_para_multiplier] .= -1
-df_thermal_calib[df_thermal_calib.max .<= 0.1, :pref_para_converged] .= 0 # once differenes are below 0.1 Mt, stop adjusting pref para
-df_thermal_calib.pref_para_adj = df_thermal_calib.pref_para_adj .* df_thermal_calib.pref_para_multiplier .* df_thermal_calib.pref_para_converged
-df_thermal_calib = select(df_thermal_calib, [:orig_grp, :dest_grp, :product_type, :pref_para_adj])
-# and now hook up with pref para df to create new dataframe
-df_pref_para_thermal  = leftjoin(df_pref_para_thermal, df_thermal_calib, on = [:orig_grp, :dest_grp, :product_type])
-df_pref_para_thermal.pref_para_thermal = df_pref_para_thermal.pref_para_thermal .+ df_pref_para_thermal.pref_para_adj
-df_pref_para_thermal = select(df_pref_para_thermal, [:orig_grp, :dest_grp, :product_type, :pref_para_thermal])
-# and save to file
-prefparaxlsxfilename = string("pref para thermal.xlsx")
-prefparaxlsxfile = joinpath(outputpath, prefparaxlsxfilename)
-XLSX.writetable(prefparaxlsxfile, collect(eachcol(df_pref_para_thermal)), names(df_pref_para_thermal), overwrite=true)
-# copy of solution file with a datestamp
-prefparaxlsxfilename = string("pref para thermal ", round(thermal_max_dev, digits=2), " Mt ", Dates.format(now(), "yyyy-mm-dd HH-MM-SS"), ".xlsx")
-prefparaxlsxfile = joinpath(thprefparaoutputpath, prefparaxlsxfilename)
-XLSX.writetable(prefparaxlsxfile, collect(eachcol(df_pref_para_thermal)), names(df_pref_para_thermal), overwrite=true)
-# copy of solution file with a datestamp and values of thermla and coking gap 
-solutionxlsxfilename = string("sol ", round(thermal_max_dev, digits=2), " Mt th ", round(coking_max_dev, digits=2), " Mt ck ", Dates.format(now(), "yyyy-mm-dd HH-MM-SS"), ".xlsx")
-solutionxlsxfile = joinpath(soloutputpath, solutionxlsxfilename)
-XLSX.writetable(solutionxlsxfile, collect(eachcol(flowslist_select)), names(flowslist_select), overwrite=true)
+    if cv_correct
+        df_factor = DataFrames.DataFrame(
+            (dest_grp = k.dest_grp, mf_s = sum(g.mf), pf_s = sum(g.pref_flow_Mt)) for
+            (k, g) in pairs(DataFrames.groupby(df_cal, [:dest_grp])))
+        df_factor.th_f = ifelse.(df_factor.mf_s .> 1e-8,
+            df_factor.pf_s ./ df_factor.mf_s, 1.0)
+        df_factor[df_factor.dest_grp .== "China", :th_f] .= 1.0
+        df_cal = leftjoin(df_cal, select(df_factor, :dest_grp, :th_f), on = :dest_grp)
+        df_cal.mf = df_cal.mf .* df_cal.th_f
+    end
+
+    return maximum(abs.(df_cal.mf .- df_cal.pref_flow_Mt))
+end
+
+coking_max_dev  = max_abs_deviation(flowslist_select, df_pref_para_links,
+    df_pref_flow_coking, "Metallurgical")
+thermal_max_dev = max_abs_deviation(flowslist_select, df_pref_para_links,
+    df_pref_flow_thermal, "Thermal"; cv_correct = true)
+
+println("Max absolute deviation — thermal: $(round(thermal_max_dev, digits=3)) Mt, " *
+        "coking: $(round(coking_max_dev, digits=3)) Mt")
+
+# ---- Write solution ----
+solutionxlsxfile = joinpath(outputpath, "solution latest.xlsx")
+XLSX.writetable(solutionxlsxfile, collect(eachcol(flowslist_select)),
+    names(flowslist_select), overwrite = true)
+
+# ---- Write preference parameters ----
+df_pref_para_thermal_out = select(df_pref_para_thermal,
+    [:orig_grp, :dest_grp, :product_type, :pref_para_thermal])
+XLSX.writetable(joinpath(outputpath, "pref para thermal.xlsx"),
+    collect(eachcol(df_pref_para_thermal_out)),
+    names(df_pref_para_thermal_out), overwrite = true)
+
+df_pref_para_coking_out = select(df_pref_para_coking,
+    [:orig_grp, :dest_grp, :product_type, :pref_para_coking])
+XLSX.writetable(joinpath(outputpath, "pref para coking.xlsx"),
+    collect(eachcol(df_pref_para_coking_out)),
+    names(df_pref_para_coking_out), overwrite = true)
+
+# ---- Timestamped copies for tracking convergence ----
+ts = Dates.format(now(), "yyyy-mm-dd HH-MM-SS")
+
+XLSX.writetable(
+    joinpath(thprefparaoutputpath,
+        "pref para thermal $(round(thermal_max_dev, digits=2)) Mt $ts.xlsx"),
+    collect(eachcol(df_pref_para_thermal_out)),
+    names(df_pref_para_thermal_out), overwrite = true)
+
+XLSX.writetable(
+    joinpath(ckprefparaoutputpath,
+        "pref para coking $(round(coking_max_dev, digits=2)) Mt $ts.xlsx"),
+    collect(eachcol(df_pref_para_coking_out)),
+    names(df_pref_para_coking_out), overwrite = true)
+
+XLSX.writetable(
+    joinpath(soloutputpath,
+        "sol $(round(thermal_max_dev, digits=2)) Mt th $(round(coking_max_dev, digits=2)) Mt ck $ts.xlsx"),
+    collect(eachcol(flowslist_select)),
+    names(flowslist_select), overwrite = true)
